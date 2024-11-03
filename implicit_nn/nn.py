@@ -46,11 +46,10 @@ def compute_broyden_update(
     return update
 
 
-class ImplicitLayer(torch.autograd.Function):
+class FixedpointLayer(torch.autograd.Function):
     """
-    This is the function that is actually used to solve a rootfinding problem.
-    It inherits from autograd.Function, so it can be backpropped through.
-    Can we make this non-abstract?
+    given a function G and an input x, return z_star such that 
+    z_star = G(z_star, x). This is the fixed point of G.
     """
 
     @staticmethod
@@ -83,13 +82,38 @@ class ImplicitLayer(torch.autograd.Function):
         return z
 
     @staticmethod
+    def lbfgs_solver(G, z_0, eps, alpha, max_iters, verbose=True):
+        z = z_0
+        z.requires_grad_(True)
+        optimizer = torch.optim.LBFGS([z], lr=alpha, history_size=5)
+
+        def closure():
+            optimizer.zero_grad()
+            loss = (z - G(z)).norm()
+            loss.backward()
+            return loss
+
+        for _ in range(max_iters):
+            optimizer.step(closure)
+
+            with torch.no_grad():
+                if torch.allclose(z, G(z), atol=eps):
+                    break
+        else:
+            if verbose:
+                print("L-BFGS did not converge.")
+        return z
+
+
+    @staticmethod
     @torch.cuda.amp.custom_fwd
-    def forward(ctx, G, z_0, eps, alpha, max_iters):
+    def forward(ctx, G, x, eps, alpha, max_iters):
         """
         :param func:
         :returns: equilibrium z_star, the root of f(z,x)
         """
-        root = ImplicitLayer.broyden_solver(G, z_0, eps, alpha, max_iters)
+        z_0 = torch.zeros_like(x)
+        root = FixedpointLayer.broyden_solver(G, z_0, eps, alpha, max_iters)
 
         """
         :param g: the pytorch function that we've found the root to.
@@ -131,7 +155,7 @@ class ImplicitLayer(torch.autograd.Function):
             z_star.grad.zero_()  # remove the gradient (this is kind of a fake grad)
             return JTxT + dl_dzstar_flat
 
-        neg_dl_dzs_J_inv = ImplicitLayer.broyden_solver(
+        neg_dl_dzs_J_inv = FixedpointLayer.broyden_solver(
             JacobianVector,
             torch.zeros_like(z_star),
             2e-7,
@@ -153,7 +177,7 @@ class DEQResidualBlock(nn.Module):
         self.conv2 = nn.Conv2d(32, 32, 3, padding=1)
         self.act = nn.ReLU()
     
-    def forward(self, z, x):
+    def forward(self, z: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         z0 = z
         z = self.groupnorm1(z)
         z = self.conv1(z)
@@ -226,7 +250,7 @@ class DEQ(nn.Module):
         z_star = self.f(z_star, x)
         # this call doesn't modify z_star, but ensures we differentiate
         # properly in the backward pass.
-        z_star = ImplicitLayer.apply(g, z_star)
+        z_star = FixedpointLayer.apply(g, z_star)
 
         return z_star
 
@@ -241,7 +265,7 @@ def finite_diff_grad_check():
     )
     input = torch.rand(1, 4, requires_grad=True, dtype=torch.float64, device=device)
     breakpoint()
-    output = ImplicitLayer.apply(get_mlp().double(), input, 1e-5, 0.1, 10)
+    output = FixedpointLayer.apply(get_mlp().double(), input, 1e-5, 0.1, 10)
 
     model = DEQ(
         f=get_mlp(),
@@ -250,7 +274,7 @@ def finite_diff_grad_check():
         backward_eps=1e-6,
         alpha=0.5,
         max_iters=100,
-        root_find_method=ImplicitLayer
+        root_find_method=FixedpointLayer
     )
 
     model.to(dtype=torch.float64, device=device)
